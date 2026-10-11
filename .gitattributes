@@ -1,0 +1,9 @@
+# .bat 必须保持 CRLF。
+# cmd.exe 靠 CRLF 做行定位，配上 chcp 65001 和多字节中文，LF 换行的批处理
+# 会让读取偏移错位——本项目就踩过：build.bat 报出「Script file 'err' does not
+# exist」这种跟真实原因毫无关系的错。不锁定的话，autocrlf=false 的机器
+# clone 下来直接是坏的。
+*.bat text eol=crlf
+
+# 其余按 Git 默认的自动判断走
+* text=auto

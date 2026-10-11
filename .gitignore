@@ -1,0 +1,18 @@
+# .claude/ 里存着本机跑测试时的工具白名单记录，其中含真实密码。
+# 这一行必须留在最前面——它一旦进仓库就是永久公开，force-push 也删不干净。
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+
+# 构建产物（exe 只作为 GitHub Release 的附件，不进版本历史）
+build/
+dist/
+PiMonitor.spec
+
+# 旧版归档：43 MB 的 v1（Tkinter）代码和 exe，本地留着回退用
+archive/
+
+# 实机截图：里面会显示真实的树莓派 IP 和用户名
+screenshot.png

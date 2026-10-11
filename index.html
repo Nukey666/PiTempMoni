@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>树莓派监控</title>
+<style>
+  :root {
+    /* 墨蓝底 + 琥珀/青/玫红，避开 Tailwind 默认色板 */
+    --bg: #0d1117;
+    --panel: #161b22;
+    --line: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --temp: #ffb454;
+    --rpm: #4ec9b0;
+    --pwm: #f778ba;
+    --err: #ff7b72;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "JetBrains Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--text);
+    font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+  }
+  body { display: flex; flex-direction: column; }
+
+  /* ------------------------------------------------ 控制栏 */
+  .bar {
+    display: flex; align-items: center; gap: 9px;
+    /* 窗口窄到一行放不下时折成两行，而不是把“断开”按钮顶出窗口外。
+       正常尺寸下（>=700px）仍然是规格要求的一行。 */
+    flex-wrap: wrap; row-gap: 6px;
+    padding: 8px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    flex: none;
+  }
+  /* 标签一律不换行、不压缩——否则窗口一窄就被挤成“主/机”这种竖排 */
+  .bar label {
+    color: var(--muted); display: flex; align-items: center; gap: 5px;
+    flex: none; white-space: nowrap;
+  }
+  .bar input {
+    background: #010409; color: var(--text);
+    border: 1px solid var(--line); border-radius: 3px;
+    padding: 4px 6px; font-family: var(--mono); font-size: 13px;
+    flex: none;
+  }
+  .bar input:focus { outline: 1px solid var(--rpm); outline-offset: 0; }
+  .bar input:disabled { background: #0d1117; color: #6e7681; }
+  /* 主机名是唯一可以牺牲宽度的字段：它那一格能整体收缩，
+     窗口略窄时先缩它，再窄才折行 */
+  .host-field { flex: 0 1 auto; min-width: 7.5em; }
+  #host { flex: 0 1 auto; min-width: 5em; width: 10em; }
+  #port { width: 4em; }
+  #user { width: 7.5em; }
+  #pass { width: 7.5em; }
+  #interval { width: 3.5em; }
+
+  button {
+    font: inherit; font-family: var(--mono);
+    color: #010409; background: var(--rpm);
+    border: 0; border-radius: 3px; padding: 5px 16px; cursor: pointer;
+    flex: none; letter-spacing: .5px;
+  }
+  button:hover:enabled { background: #6fdcc4; }
+  button:disabled { background: #30363d; color: #6e7681; cursor: default; }
+  button.on { background: var(--err); color: #010409; }
+  button.on:hover { background: #ff9a92; }
+
+  /* 状态栏是唯一允许被压缩的元素：控件都 flex:none，空间不够时截断的只能是它 */
+  #status {
+    margin-left: auto; color: var(--muted);
+    font-family: var(--mono); font-size: 12px;
+    flex: 1 1 auto; min-width: 0; text-align: right;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #status.ok { color: var(--rpm); }
+  #status.err { color: var(--err); }
+
+  /* ------------------------------------------------ 大号读数 */
+  .readouts {
+    display: flex; flex: none;
+    border-bottom: 1px solid var(--line);
+    background: var(--line);       /* 用背景色透出 1px 分隔线 */
+    gap: 1px;
+  }
+  .cell {
+    flex: 1; background: var(--bg); padding: 9px 18px 11px;
+    border-top: 2px solid transparent;    /* 用顶部色条代替图例：跟曲线同色 */
+  }
+  .cell.temp { border-top-color: var(--temp); }
+  .cell.rpm  { border-top-color: var(--rpm); }
+  .cell.pwm  { border-top-color: var(--pwm); }
+  .cell .value {
+    font-family: var(--mono); font-size: 30px; font-weight: 600;
+    line-height: 1.15; font-variant-numeric: tabular-nums;
+  }
+  .cell .label {
+    color: var(--muted); font-size: 11px;
+    letter-spacing: .12em; text-transform: uppercase; margin-top: 3px;
+  }
+  .cell.temp .value { color: var(--temp); }
+  .cell.rpm  .value { color: var(--rpm); }
+  .cell.pwm  .value { color: var(--pwm); }
+  .cell .unit { font-size: 14px; color: var(--muted); margin-left: 4px; }
+
+  /* ------------------------------------------------ 图表 */
+  main { flex: 1; min-height: 0; position: relative; }
+  #chart { position: absolute; inset: 0; }
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <!-- 主机和用户名不预填：预填一个不是用户自己的值（规格原文写的是
+       192.168.1.100 / pi），比留空更容易让人直接点「连接」连错地方。
+       端口和间隔是协议/行为默认，跟"哪台机器"无关，保留。 -->
+  <label class="host-field">主机 <input id="host"></label>
+  <label>端口 <input id="port" value="22"></label>
+  <label>用户 <input id="user"></label>
+  <label>密码 <input id="pass" type="password"></label>
+  <label>间隔 <input id="interval" value="2"><span style="color:#8b949e">s</span></label>
+  <button id="btn" disabled>连接</button>
+  <span id="status">正在启动 ...</span>
+</div>
+
+<div class="readouts">
+  <div class="cell temp">
+    <div class="value" id="v-temp">—</div>
+    <div class="label">温度 <span class="unit">°C</span></div>
+  </div>
+  <div class="cell rpm">
+    <div class="value" id="v-rpm">—</div>
+    <div class="label">转速 <span class="unit">RPM</span></div>
+  </div>
+  <div class="cell pwm">
+    <div class="value" id="v-pwm">—</div>
+    <div class="label">PWM <span class="unit">%</span></div>
+  </div>
+</div>
+
+<main><div id="chart"></div></main>
+
+<!-- 本地文件，不走 CDN：没网也能出图。要换回 CDN 就把这行换成
+     https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js -->
+<script src="echarts.min.js"></script>
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const INPUTS = ["host", "port", "user", "pass", "interval"];
+// 图上同时保留的采样点数上限。900 = 默认间隔（2s）下的 30 分钟。
+// 这个上限同时也是缩放旋钮：间隔短就看得细、窗口自然变短；间隔长就拉得远。
+// 不按「固定 30 分钟窗口、点数随间隔浮动」来做——那样在 0.5s 间隔下要画 3600 个点，
+// 而温度在 0.5 秒尺度上基本不动，多出来的点全是冗余。
+const MAX_POINTS = 900;
+
+// 只有曲线用得到的颜色。PWM 不再进图，它的粉色只留在大号读数的 CSS 变量 --pwm 上。
+const COLOR = { temp: "#ffb454", rpm: "#4ec9b0" };
+
+const TEMP_MAX = 100;            // 温度轴上限，也是渐变的满色点（两处必须一致）
+const TEMP_ALERT = 85;           // °C。图上拉一条虚线标出这条阈值（见温度系列的 markLine）
+
+// 温度曲线的渐变色标：等距落在 0 / 25 / 50 / 75 / 100 °C 上，
+// 冰蓝 → 淡青 → 暖黄 → 橙 → 火红。
+// 中间的淡青没用 #4ec9b0——那是转速曲线的颜色，温度走到 25°C 附近两线会撞成一样的。
+const TEMP_RAMP = ["#58a6ff", "#7fd6ff", "#ffd166", "#ff8c42", "#f85149"];
+const MONO = 'ui-monospace, "Cascadia Mono", Consolas, monospace';
+const UNIT = { "温度": " °C", "转速": " RPM" };
+
+const PWM_FULL_SCALE = 255;      // sysfs 的 pwm1 原始值是 0~255
+
+/** 0~255 换算成百分比，只给大号读数用，且**归到十位**（0 / 10 / 20 ... 100）。
+ *
+ *  PWM 是分档的（设备树 cooling-levels = [0,75,125,175,250]，内核调速器只写这五档），
+ *  不是连续量——所以它不进图、也没有专属坐标轴：给五级信号配一把无级尺子，
+ *  只会让人以为它连续可变。PWM 是「因」、转速是「果」，果已经在图上了。
+ *
+ *  归到十位之后，五个档位正好落成 0 / 30 / 50 / 70 / 100，一位十进数就是一级，
+ *  读数不用再跟 29、49、69、98 这种不是整十的数较劲。
+ *  注意：顶格 250 其实是满量程的 98%，显示 100% 是取整的结果——
+ *  内核并没有真的写满 255。 */
+function pwmPercent(v) {
+  if (v === null || v === undefined) return null;
+  return Math.round(v / PWM_FULL_SCALE * 10) * 10;
+}
+
+/** 悬浮提示：把单位和“无数据”补上，否则两条线的数值看不出是什么。 */
+function tooltipText(params) {
+  let out = params[0].axisValue;
+  params.forEach((p) => {
+    const v = (p.value === null || p.value === undefined)
+      ? "—" : p.value + (UNIT[p.seriesName] || "");
+    out += "<br>" + p.marker + " " + p.seriesName + "&nbsp;&nbsp;" + v;
+  });
+  return out;
+}
+const AXIS_LABEL = { color: "#8b949e", fontFamily: MONO, fontSize: 11 };
+const AXIS_LINE = { lineStyle: { color: "#30363d" } };
+const SPLIT_LINE = { lineStyle: { color: "#30363d", opacity: 0.35 } };
+
+// ------------------------------------------------------------------ 状态栏
+function setStatus(text, kind) {
+  const el = $("status");
+  el.textContent = text;
+  el.title = text;          // 太长的错误信息会被省略号截断，悬停可看全
+  el.className = kind || "";
+}
+function lockInputs(locked) {
+  INPUTS.forEach((id) => { $(id).disabled = locked; });
+}
+
+// ------------------------------------------------------------------ 图表
+const chart = echarts.init($("chart"), null, { renderer: "canvas" });
+const times = [], temps = [], rpms = [];
+
+chart.setOption({
+  backgroundColor: "transparent",
+  animation: false,
+  textStyle: { color: "#e6edf3" },
+  // 不放图例：轴名/刻度/大号读数都跟曲线同色，已经能对上号了；
+  // 悬浮图例在窄窗口里必然和两侧轴名打架。
+  // right 只要留一根「转速 RPM」的宽度（PWM 轴撤掉后不再需要 148）。
+  grid: { left: 58, right: 86, top: 34, bottom: 42 },
+  tooltip: {
+    trigger: "axis",
+    backgroundColor: "#161b22",
+    borderColor: "#30363d",
+    textStyle: { color: "#e6edf3", fontFamily: MONO, fontSize: 12 },
+    formatter: tooltipText,
+  },
+  // 温度曲线按温度连续着色：0°C 冰蓝 → 100°C 火红。
+  // 不写 dimension：默认就是数据的最后一个维度，也就是温度值本身。
+  // （试过显式写 dimension:1，结果和不写完全一样，那就别写死一个索引。）
+  // min/max 必须跟温度轴对齐，否则同一个温度在刻度上和颜色上是两个位置。
+  // show:false 是不要 visualMap 自带的那个选择条控件——颜色本身就是图例。
+  visualMap: {
+    type: "continuous",
+    show: false,
+    seriesIndex: 0,
+    min: 0,
+    max: TEMP_MAX,
+    inRange: { color: TEMP_RAMP },
+  },
+  xAxis: {
+    type: "category",
+    data: times,
+    boundaryGap: false,
+    axisLine: AXIS_LINE,
+    axisTick: { show: false },
+    axisLabel: AXIS_LABEL,
+  },
+  yAxis: [
+    {   // 0：温度，左轴。0~100 每 10 一格，横向分划密一些
+      // max 用 TEMP_MAX 而不是字面量：它必须和 visualMap 的 max 一致
+      type: "value", name: "温度 °C", min: 0, max: TEMP_MAX, interval: 10,
+      position: "left",
+      nameTextStyle: { color: COLOR.temp, fontFamily: MONO, fontSize: 11, padding: [0, 0, 4, 0] },
+      axisLabel: Object.assign({ color: COLOR.temp }, { fontFamily: MONO, fontSize: 11 }),
+      axisLine: { show: true, lineStyle: { color: COLOR.temp, opacity: 0.5 } },
+      axisTick: { show: false },
+      splitLine: SPLIT_LINE,
+    },
+    {   // 1：转速，右轴
+      type: "value", name: "转速 RPM", min: 0, max: 10000,
+      position: "right",
+      nameTextStyle: { color: COLOR.rpm, fontFamily: MONO, fontSize: 11, padding: [0, 0, 4, 0] },
+      axisLabel: { color: COLOR.rpm, fontFamily: MONO, fontSize: 11 },
+      axisLine: { show: true, lineStyle: { color: COLOR.rpm, opacity: 0.5 } },
+      axisTick: { show: false },
+      splitLine: { show: false },
+    },
+  ],
+  series: [
+    {
+      // 这里**不能**写 lineStyle.color / itemStyle.color：写了就会盖掉上面
+      // visualMap 按温度算出来的颜色，曲线会永远停在同一个色上（实测过，
+      // 低温 5°C 和高温 98°C 画出来都是同一支琥珀 #ffb454）。
+      // 颜色全权交给 visualMap，这里只管线宽。
+      name: "温度", type: "line", yAxisIndex: 0, data: temps,
+      smooth: true, showSymbol: false,
+      lineStyle: { width: 1.8 },
+      // 阈值用虚线标位置，而不是把曲线改成硬红——颜色已经交给渐变编码了，
+      // 再叠一层固定色等于在渐变上切一刀。虚线管“在哪”，标签管“多少”。
+      markLine: {
+        silent: true,
+        symbol: "none",
+        lineStyle: { color: "#f85149", type: "dashed", width: 1, opacity: 0.6 },
+        label: {
+          formatter: TEMP_ALERT + " °C", position: "insideEndTop",
+          color: "#f85149", fontFamily: MONO, fontSize: 11,
+        },
+        data: [{ yAxis: TEMP_ALERT }],
+      },
+    },
+    {
+      name: "转速", type: "line", yAxisIndex: 1, data: rpms,
+      showSymbol: false, connectNulls: false,   // 无反馈时留空，不连成直线
+      lineStyle: { color: COLOR.rpm, width: 1.8 },
+      itemStyle: { color: COLOR.rpm },
+    },
+  ],
+});
+window.addEventListener("resize", () => chart.resize());
+
+// ------------------------------------------------------------------ 读数区
+function showValue(id, value) {
+  $(id).textContent = (value === null || value === undefined) ? "—" : value;
+}
+
+/** 把两个数组同步到图上。 */
+function syncChart() {
+  chart.setOption({
+    xAxis: { data: times },
+    series: [
+      { data: temps },
+      { data: rpms },
+    ],
+  });
+}
+
+// ------------------------------------------------------------------ Python 回调
+function clock(d) {
+  const p = (n) => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+window.onSample = function (d) {
+  const now = clock(new Date());
+  times.push(now);
+  temps.push(d.temp);
+  rpms.push(d.rpm);
+  while (times.length > MAX_POINTS) {
+    times.shift(); temps.shift(); rpms.shift();
+  }
+  syncChart();
+
+  showValue("v-temp", d.temp);
+  showValue("v-rpm", d.rpm);
+  showValue("v-pwm", pwmPercent(d.pwm));
+
+  // 数值上面的大号读数已经显示了，状态栏只说状态，把宽度让给错误信息。
+  // 温度是必选项：读不到就是真出了问题，不能还挂着绿色的“采集中”当没事发生
+  // （Python 侧连续几轮拿不到会报错停机，这里先让第一眼就能看出不对）。
+  if (d.temp === null || d.temp === undefined) {
+    setStatus("采集中 · 温度读取失败", "err");
+  } else if (d.rpm === null || d.rpm === undefined) {
+    setStatus("采集中 · 转速无反馈", "ok");
+  } else {
+    setStatus("采集中", "ok");
+  }
+};
+
+window.onError = function (msg) {
+  setStatus(msg, "err");
+  finish("");
+};
+
+window.onStopped = function () {
+  finish("已停止");
+};
+
+// ------------------------------------------------------------------ 连接 / 断开
+let connected = false;
+
+function finish(text) {
+  if (!connected) return;
+  connected = false;
+  $("btn").textContent = "连接";
+  $("btn").classList.remove("on");
+  $("btn").disabled = false;
+  lockInputs(false);
+  if (text) setStatus(text);
+}
+
+function clearData() {
+  times.length = 0; temps.length = 0; rpms.length = 0;
+  syncChart();
+  ["v-temp", "v-rpm", "v-pwm"].forEach((id) => showValue(id, null));
+}
+
+async function toggle() {
+  const btn = $("btn");
+
+  if (!connected) {
+    btn.disabled = true;
+    setStatus("连接中 ...");
+    let r;
+    try {
+      r = await pywebview.api.connect(
+        $("host").value.trim(), $("port").value.trim(),
+        $("user").value.trim(), $("pass").value,
+        $("interval").value.trim());
+    } catch (e) {
+      r = { ok: false, msg: "调用失败: " + e };
+    }
+    btn.disabled = false;
+
+    if (!r.ok) { setStatus(r.msg, "err"); return; }
+
+    clearData();               // 每次连接都从空图开始
+    connected = true;
+    btn.textContent = "断开";
+    btn.classList.add("on");
+    lockInputs(true);
+    setStatus(r.msg + "，等待采样 ...", "ok");
+    return;
+  }
+
+  // 先落 connected，避免采集线程的 onStopped 抢先改状态栏
+  connected = false;
+  btn.disabled = true;
+  try {
+    await pywebview.api.disconnect();
+  } catch (e) {
+    setStatus("断开失败: " + e, "err");
+  }
+  btn.disabled = false;
+  btn.textContent = "连接";
+  btn.classList.remove("on");
+  lockInputs(false);
+  setStatus("已断开");
+}
+
+$("btn").addEventListener("click", toggle);
+
+// 桥就绪前按钮不可点，避免 pywebview.api 还不存在
+window.addEventListener("pywebviewready", () => {
+  $("btn").disabled = false;
+  setStatus("就绪");
+});
+
+// 给自动化检查读内部状态用（脚本作用域的 const 从外面取不到）
+window.__state = { times: times, temps: temps, rpms: rpms, chart: chart };
+</script>
+</body>
+</html>
